@@ -1,0 +1,78 @@
+import torch
+import triton
+import triton.language as tl
+from triton import Config, autotune
+
+
+@triton.autotune(
+    configs=[
+        Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64}, num_warps=4, num_stages=2),
+        Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64}, num_warps=4, num_stages=3),
+        Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64}, num_warps=4, num_stages=4),
+        Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64}, num_warps=8, num_stages=2),
+        Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64}, num_warps=8, num_stages=3),
+        Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64}, num_warps=8, num_stages=4),
+        Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64}, num_warps=16, num_stages=2),
+        Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64}, num_warps=16, num_stages=3),
+        Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64}, num_warps=16, num_stages=4),
+    ],
+    key=['k'],
+)
+@triton.jit
+def _per_group_transpose(
+    data_ptr: torch.Tensor,
+    trans_data_ptr: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    k: int,
+    M_ALIGNMENT: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    m_id = tl.program_id(1)
+    k_id = tl.program_id(2)
+
+    curr_expert_offset = tl.load(expert_offsets + expert_id)
+    next_expert_offset = tl.load(expert_offsets + expert_id + 1)
+    num_tokens_of_expert = next_expert_offset - curr_expert_offset
+
+    data_start_ptr = data_ptr + curr_expert_offset * k
+    trans_data_start_ptr = trans_data_ptr + curr_expert_offset * k
+
+    k_coord = k_id * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    k_mask = k_coord < k
+
+    num_m_programs = tl.num_programs(1)
+    for start_m in tl.range(0, num_tokens_of_expert, BLOCK_SIZE_M * num_m_programs):
+        m_coord = start_m + m_id * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        m_mask = m_coord < num_tokens_of_expert
+        off = m_coord[:, None] * k + k_coord[None, :]
+        trans_off = m_coord[:, None] + k_coord[None, :] * num_tokens_of_expert
+        mask = m_mask[:, None] & k_mask[None, :]
+
+        data = tl.load(data_start_ptr + off, mask=mask)
+        tl.store(trans_data_start_ptr + trans_off, data, mask=mask)
+
+
+def per_group_transpose(
+    a: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    M_ALIGNMENT: int = 1,
+) -> torch.Tensor:
+    assert a.dim() == 2
+    assert a.is_contiguous(), "`a` is not contiguous"
+
+    m, k = a.size()
+    trans_a = torch.empty_like(a)
+    num_experts = expert_offsets.size(0) - 1
+
+    num_m_blocks = 4
+    grid = lambda META: (
+        num_experts,
+        num_m_blocks,
+        triton.cdiv(k, META["BLOCK_SIZE_K"]),
+    )
+    _per_group_transpose[grid](
+        a, trans_a, expert_offsets, k, M_ALIGNMENT
+    )
+    return trans_a
